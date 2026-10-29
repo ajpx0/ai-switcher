@@ -1,0 +1,221 @@
+stages:
+  - test
+  - build
+  - release
+  - release-extra
+
+variables:
+  RELEASE_SOURCE_BRANCH:
+    value: develop
+    description: Create Release Commit のマージ元ブランチ
+  RELEASE_VERSION:
+    value: ""
+    description: Create Release Commit のバージョン (x.y.z)
+
+.windows:
+  tags: [saas-windows-medium-amd64]
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR\.cargo
+  cache:
+    key: windows-x86_64-pc-windows-msvc
+    paths:
+      - .cargo/registry/
+      - .pnpm-store/
+      - src-tauri/target/
+  before_script:
+    - $ProgressPreference = 'SilentlyContinue'
+    - $v = (Invoke-RestMethod https://nodejs.org/dist/index.json | Where-Object { $_.lts } | Select-Object -First 1).version
+    - Invoke-WebRequest "https://nodejs.org/dist/$v/node-$v-win-x64.zip" -OutFile node.zip
+    - Expand-Archive node.zip -DestinationPath C:\node
+    - $env:Path = "C:\node\node-$v-win-x64;$env:CARGO_HOME\bin;$env:Path"
+    - Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+    - .\rustup-init.exe -y --profile minimal --target x86_64-pc-windows-msvc
+    - npm i -g pnpm@11
+    - pnpm config set store-dir .pnpm-store
+    - pnpm i --frozen-lockfile --prefer-offline
+
+.macos:
+  tags: [saas-macos-medium-m1]
+  image: macos-15-xcode-16
+  when: manual
+  allow_failure: true
+  before_script:
+    - curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --target aarch64-apple-darwin
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - brew install node pnpm
+    - pnpm i --frozen-lockfile --prefer-offline
+
+.linux-rust:
+  image: rust:1-bookworm
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+build:
+  extends: .windows
+  stage: build
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != "main"
+  script:
+    - pnpm tauri build --target x86_64-pc-windows-msvc
+
+linux-startup:
+  stage: test
+  image: rust:1-bookworm
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH =~ /^fix\//)
+  script:
+    - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    - apt-get install -y nodejs
+    - rustc --edition=2021 --test src-tauri/src/linux_gtk.rs -o /tmp/linux-gtk-tests
+    - /tmp/linux-gtk-tests
+    - node --experimental-strip-types --test tests/linuxGtkStartup.test.ts
+
+mr-frontend:
+  stage: test
+  image: node:24-bookworm
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - npm i -g pnpm@11
+    - pnpm install --frozen-lockfile
+    - pnpm build
+    - pnpm test
+
+mr-rust:
+  extends: .linux-rust
+  stage: test
+  interruptible: true
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - rustup component add rustfmt
+    - |
+      bash <<'EOF'
+      set -euo pipefail
+      base="${CI_MERGE_REQUEST_DIFF_BASE_SHA:-$CI_COMMIT_BEFORE_SHA}"
+      mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$base" "$CI_COMMIT_SHA" -- 'src-tauri/**/*.rs')
+      if (( ${#files[@]} )); then
+        rustfmt --edition 2021 --check --config skip_children=true "${files[@]}"
+      fi
+      EOF
+    - cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+mr-platform-windows:
+  stage: test
+  tags: [saas-windows-medium-amd64]
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - $ProgressPreference = 'SilentlyContinue'
+    - Invoke-WebRequest https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+    - .\rustup-init.exe -y --profile minimal
+    - $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+    - cargo check --locked --manifest-path src-tauri/Cargo.toml
+
+mr-platform-macos:
+  stage: test
+  tags: [saas-macos-medium-m1]
+  image: macos-15-xcode-16
+  when: manual
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - cargo check --locked --manifest-path src-tauri/Cargo.toml
+
+release-windows:
+  extends: .windows
+  stage: build
+  resource_group: release
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"
+  script:
+    - $ver = ($env:CI_COMMIT_TITLE -replace '\s', '')
+    - pnpm version:bump "$ver"
+    - pnpm tauri build --target x86_64-pc-windows-msvc
+    - $stage = "$env:CI_PROJECT_DIR\msix"
+    - New-Item -ItemType Directory -Force $stage | Out-Null
+    - Copy-Item scripts\msix\*, src-tauri\target\x86_64-pc-windows-msvc\release\ai-switcher.exe $stage
+    - (Get-Content "$stage\AppxManifest.xml" -Raw).Replace('Version="0.0.0.0"', "Version=`"$ver.0`"") | Set-Content "$stage\AppxManifest.xml" -Encoding utf8
+    - npx -y @microsoft/winappcli pack $stage --quiet
+    - $src = Get-ChildItem src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\*-setup.exe | Select-Object -First 1
+    - $dst = Join-Path $src.DirectoryName ($src.Name -replace "_$([regex]::Escape($ver))", '')
+    - Move-Item $src.FullName $dst
+    - |
+      foreach ($f in @(Get-Item $dst) + @(Get-ChildItem *.msix)) {
+        $u = "$env:CI_API_V4_URL/projects/$env:CI_PROJECT_ID/packages/generic/release/$ver/$($f.Name)"
+        Invoke-RestMethod -Method Put -Uri $u -Headers @{ 'JOB-TOKEN' = $env:CI_JOB_TOKEN } -InFile $f.FullName
+        "$($f.Name)`t$u" | Add-Content release-assets-windows.txt
+      }
+  artifacts:
+    paths:
+      - release-assets-windows.txt
+
+release-publish:
+  stage: release
+  image: alpine:3.20
+  needs: [release-windows]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"
+  script:
+    - apk add --no-cache curl jq
+    - ver=$(echo "$CI_COMMIT_TITLE" | tr -d '[:space:]')
+    - |
+      links=$(cat release-assets-*.txt | tr -d '\r' | jq -R -s 'split("\n") | map(select(length > 0) | split("\t") | {name: .[0], url: .[1], link_type: "package"})')
+    - |
+      jq -n --arg tag "$ver" --arg ref "$CI_COMMIT_SHA" --arg name "AI Switcher $ver" --arg desc "AI Switcher $ver $CI_COMMIT_SHA" --argjson links "$links" '{tag_name: $tag, name: $name, ref: $ref, description: $desc, assets: {links: $links}}' > release.json
+    - |
+      curl --fail-with-body -H "JOB-TOKEN: $CI_JOB_TOKEN" -H "Content-Type: application/json" -d @release.json "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+
+release-macos:
+  extends: .macos
+  stage: release-extra
+  needs: [release-publish]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main"
+      when: manual
+      allow_failure: true
+  script:
+    - ver=$(echo "$CI_COMMIT_TITLE" | tr -d '[:space:]')
+    - pnpm version:bump "$ver"
+    - pnpm tauri build --target aarch64-apple-darwin
+    - src=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -1)
+    - file="${src/_$ver/}"
+    - mv "$src" "$file"
+    - n=$(basename "$file")
+    - u="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/release/$ver/$n"
+    - |
+      curl --fail -H "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file "$file" "$u"
+    - |
+      curl --fail-with-body -H "JOB-TOKEN: $CI_JOB_TOKEN" --data-urlencode "name=$n" --data-urlencode "url=$u" --data "link_type=package" "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases/$ver/assets/links"
+
+create-release-commit:
+  stage: build
+  image: alpine:3.20
+  resource_group: create-release-commit
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web" && $RELEASE_VERSION
+  before_script:
+    - apk add --no-cache git
+  script:
+    - |
+      set -eu
+      echo "$RELEASE_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "Invalid version: $RELEASE_VERSION" >&2; exit 1; }
+      git config user.name "$GITLAB_USER_NAME"
+      git config user.email "$GITLAB_USER_EMAIL"
+      git remote set-url origin "https://oauth2:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      git fetch origin main "$RELEASE_SOURCE_BRANCH"
+      git checkout -B main origin/main
+      git merge --no-ff -m "$RELEASE_VERSION" "origin/$RELEASE_SOURCE_BRANCH"
+      git push origin main
