@@ -914,11 +914,13 @@ fn encrypt_token_cache(plaintext: &str) -> Result<String> {
 
 #[cfg(target_os = "macos")]
 fn macos_aes_key() -> Result<[u8; 16]> {
-    let password = security_framework::passwords::get_generic_password(
-        "Claude Safe Storage",
-        "Claude",
-    )
-    .context("Failed to read 'Claude Safe Storage' password from macOS Keychain. Allow access when prompted, or launch Claude Desktop and sign in at least once.")?;
+    let password = ["Claude Key", "Claude"]
+        .iter()
+        .find_map(|account| {
+            security_framework::passwords::get_generic_password("Claude Safe Storage", account)
+                .ok()
+        })
+        .context("Failed to read 'Claude Safe Storage' password from macOS Keychain. Allow access when prompted, or launch Claude Desktop and sign in at least once.")?;
 
     let key = pbkdf2::pbkdf2_hmac_array::<sha1::Sha1, 16>(&password, b"saltysalt", 1003);
     Ok(key)

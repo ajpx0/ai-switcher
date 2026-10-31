@@ -237,6 +237,7 @@ pub async fn fetch_cursor_account_metadata(
     let AuthData::Cursor { access_token, .. } = &account.auth_data else {
         anyhow::bail!("Account is not a Cursor account");
     };
+    let access_token = &crate::auth::cursor_api_token(access_token)?;
 
     let response = send_cursor_request(
         "aiserver.v1.DashboardService/GetPlanInfo",
@@ -508,6 +509,7 @@ async fn get_usage_with_cursor_auth(account: &StoredAccount) -> Result<UsageInfo
     let AuthData::Cursor { access_token, .. } = &account.auth_data else {
         anyhow::bail!("Account is not a Cursor account");
     };
+    let access_token = &crate::auth::cursor_api_token(access_token)?;
 
     let usage_response = send_cursor_request(
         "aiserver.v1.DashboardService/GetCurrentPeriodUsage",
