@@ -8,6 +8,48 @@ const CURSOR_ACCESS_TOKEN_KEY: &str = "cursorAuth/accessToken";
 const CURSOR_REFRESH_TOKEN_KEY: &str = "cursorAuth/refreshToken";
 const CURSOR_EMAIL_KEY: &str = "cursorAuth/cachedEmail";
 const CURSOR_PLAN_KEY: &str = "cursorAuth/stripeMembershipType";
+const CURSOR_SAFE_STORAGE_PREFIX: &str = "cursor-safe-storage:v1:";
+
+pub fn cursor_api_token(token: &str) -> Result<String> {
+    match token.strip_prefix(CURSOR_SAFE_STORAGE_PREFIX) {
+        Some(encrypted) => decrypt_cursor_safe_storage(encrypted),
+        None => Ok(token.to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn decrypt_cursor_safe_storage(encrypted_b64: &str) -> Result<String> {
+    use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    use base64::Engine;
+    type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encrypted_b64.as_bytes())
+        .context("Failed to base64-decode Cursor token")?;
+    let ciphertext = raw
+        .strip_prefix(b"v10")
+        .context("Unsupported or malformed Cursor token")?;
+
+    let password = ["Cursor Key", "Cursor"]
+        .iter()
+        .find_map(|account| {
+            security_framework::passwords::get_generic_password("Cursor Safe Storage", account)
+                .ok()
+        })
+        .context("Failed to read 'Cursor Safe Storage' password from macOS Keychain. Allow access when prompted.")?;
+    let key = pbkdf2::pbkdf2_hmac_array::<sha1::Sha1, 16>(&password, b"saltysalt", 1003);
+    let iv: [u8; 16] = [0x20; 16];
+
+    let plaintext = Aes128CbcDec::new(&key.into(), &iv.into())
+        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .map_err(|e| anyhow::anyhow!("AES-CBC decrypt failed: {e}"))?;
+    String::from_utf8(plaintext).context("Decrypted Cursor token is not valid UTF-8")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn decrypt_cursor_safe_storage(_encrypted_b64: &str) -> Result<String> {
+    anyhow::bail!("Encrypted Cursor tokens are only supported on macOS")
+}
 
 pub fn import_current_cursor_account(account_name: String) -> Result<StoredAccount> {
     let conn = open_cursor_state_db()?;
